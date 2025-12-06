@@ -5,6 +5,10 @@ import { useQuery, QueryClient, QueryClientProvider } from '@tanstack/react-quer
 // --- DEBUGGING LOGS ---
 console.log("App.jsx wird geladen...");
 
+// --- API KONFIGURATION ---
+// Erkennt automatisch, ob wir "live" auf dem Webspace sind
+const IS_PRODUCTION = import.meta.env.PROD; 
+
 // --- TANSTACK QUERY CLIENT ---
 let queryClient;
 try {
@@ -78,7 +82,6 @@ const MOCK_MANAGERS = [
     { id: 3, name: "Liga-Rival", points: 950, place: 3 },
 ];
 
-// Erweitertes Mock-Kader
 const MOCK_SQUAD = [
     // STARTELF (inLineup: true)
     { id: '2576', name: "Jamal Musiala", team: "FCB", points: 125, status: "live", inLineup: true },
@@ -108,26 +111,52 @@ const MOCK_MATCHES = [
 // --- TOKEN LOGIK ---
 const getKickbaseToken = () => {
     try {
-        // Prüfe localStorage auf gespeicherten Token
         const storedToken = localStorage.getItem('kb_auth_token');
         if (storedToken) return storedToken;
-
-        // Fallback für alte Methoden
         const directToken = localStorage.getItem('token');
         if (directToken) return directToken.replace(/"/g, '');
     } catch (e) {}
     return null; 
 };
 
+// --- API HELPER (PROXY WEICHE) ---
+const apiCall = async (endpoint, method = 'GET', body = null, token = null) => {
+    let url;
+    let options = {
+        method: method,
+        headers: { "Content-Type": "application/json" }
+    };
+
+    if (token) options.headers['Authorization'] = `Bearer ${token}`;
+    if (body) options.body = JSON.stringify(body);
+
+    if (IS_PRODUCTION) {
+        // AUF WEBSPACE: Nutze proxy.php
+        // Wir senden den Ziel-Endpunkt als Query-Parameter 'endpoint'
+        url = `proxy.php?endpoint=${encodeURIComponent(endpoint)}`;
+        // WICHTIG: Authorization Header muss über proxy.php geschleift werden (machen wir im PHP Skript)
+    } else {
+        // LOKAL: Direkter Versuch (könnte CORS Fehler werfen)
+        url = `https://api.kickbase.com/v4${endpoint}`;
+    }
+
+    const response = await fetch(url, options);
+    
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`API Fehler ${response.status}: ${errorText}`);
+    }
+    
+    return await response.json();
+};
+
 // --- API FUNKTIONEN ---
 const fetchPlayerData = async (playerId, accessToken) => {
     if (accessToken === 'DEMO_MODE') { await new Promise(r => setTimeout(r, 600)); return MOCK_PLAYER_DATA; }
     if (!accessToken) throw new Error("Kein Token.");
-    const response = await fetch(`https://api.kickbase.com/v4/players/${playerId}/events`, {
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    });
-    if (!response.ok) throw new Error(`API Fehler: ${response.status}`);
-    const rawData = await response.json(); 
+    
+    const rawData = await apiCall(`/players/${playerId}/events`, 'GET', null, accessToken);
+    
     return { 
         playerName: rawData.n || rawData.name, 
         teamName: rawData.teamName || "Team", 
@@ -389,22 +418,9 @@ const LoginScreen = ({ onSetToken }) => {
         setError(null);
 
         try {
-            // Echter API Call an Kickbase
-            const response = await fetch("https://api.kickbase.com/v4/user/login", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ email: email, password: password })
-            });
+            // LOGIN CALL (nutzt nun die apiCall Helferfunktion für Proxy-Support)
+            const data = await apiCall('/user/login', 'POST', { email, password });
 
-            if (!response.ok) {
-                // Bei Fehler: Wahrscheinlich falsche Daten oder CORS
-                const txt = await response.text();
-                // Wenn wir einen CORS Fehler haben (Browser blockiert), können wir das hier nicht unterscheiden,
-                // da der Browser die Response komplett versteckt.
-                throw new Error("Login fehlgeschlagen. Bitte Daten prüfen.");
-            }
-
-            const data = await response.json();
             if (data && data.token) {
                 // TOKEN ERHALTEN! Speichern im localStorage
                 localStorage.setItem('kb_auth_token', data.token);
@@ -415,8 +431,10 @@ const LoginScreen = ({ onSetToken }) => {
 
         } catch (err) {
             console.error(err);
-            if (err.message.includes("Failed to fetch")) {
-                setError("Netzwerkfehler (CORS). Die Kickbase-API erlaubt keinen direkten Browser-Zugriff von dieser Domain. Nutzen Sie den Demo-Modus zum Testen.");
+            if (err.message.includes("Failed to fetch") && !IS_PRODUCTION) {
+                setError("Netzwerkfehler (CORS) im Entwicklungsmodus. Bitte 'Demo Modus' nutzen.");
+            } else if (IS_PRODUCTION) {
+                setError("Fehler: " + err.message + ". Hast du 'proxy.php' hochgeladen?");
             } else {
                 setError(err.message);
             }
